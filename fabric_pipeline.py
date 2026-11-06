@@ -110,15 +110,56 @@ class FabricModel(nn.Module):
                 self.variance[None, :, None, None]).mean(1).sqrt()
 
 
-def read_image(path, size, device):
+def decode_image(path):
     image = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f'无法读取图片: {path}')
+    return image
+
+
+def preprocess_image(image, size):
     rgb = cv2.cvtColor(cv2.resize(image, (size, size)), cv2.COLOR_BGR2RGB)
-    x = torch.from_numpy(rgb.copy()).permute(2, 0, 1).float().div_(255).to(device)
-    mean = x.new_tensor([.485, .456, .406])[:, None, None]
-    std = x.new_tensor([.229, .224, .225])[:, None, None]
-    return image, ((x - mean) / std).unsqueeze(0)
+    # Normalize on CPU, transfer one contiguous tensor instead of many CUDA ops.
+    array = rgb.astype(np.float32) / 255.
+    array = (array - np.array([.485, .456, .406], dtype=np.float32)) / np.array([.229, .224, .225], dtype=np.float32)
+    return torch.from_numpy(array.transpose(2, 0, 1).copy())
+
+
+def read_image(path, size, device):
+    image = decode_image(path)
+    return image, preprocess_image(image, size).unsqueeze(0).to(device)
+
+
+class FeatureImages(torch.utils.data.Dataset):
+    def __init__(self, paths, size):
+        self.paths, self.size = list(paths), size
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        return preprocess_image(decode_image(self.paths[index]), self.size), index
+
+
+@torch.no_grad()
+def feature_batches(model, paths, size, device, batch_size=16, workers=0):
+    paths = list(paths)
+    loader = torch.utils.data.DataLoader(FeatureImages(paths, size), batch_size=batch_size,
+                                        num_workers=workers, pin_memory=str(device).startswith('cuda'))
+    for x, indices in loader:
+        features = model.encode(x.to(device, non_blocking=True))
+        yield [paths[i] for i in indices.tolist()], features
+
+
+def fuse_backbone(module):
+    """In-place eval Conv+BN fusion; deployment only, no checkpoint mutation."""
+    for child in module.children():
+        fuse_backbone(child)
+    if isinstance(module, nn.Sequential):
+        for index in range(len(module)-1):
+            if isinstance(module[index], nn.Conv2d) and isinstance(module[index+1], nn.BatchNorm2d):
+                module[index] = torch.nn.utils.fuse_conv_bn_eval(module[index], module[index+1])
+                module[index+1] = nn.Identity()
 
 
 def pool_region(feature, box):
@@ -188,24 +229,22 @@ def check_dataset(spec, duplicate_report='results/dataset_duplicates.json'):
 
 
 @torch.no_grad()
-def fit_normal(model, spec, size, device):
+def fit_normal(model, spec, size, device, batch_size=16, workers=0):
     """Fit normal train moments, then calibrate on normal validation only."""
     total = torch.zeros(48, device=device, dtype=torch.float64)
     square = total.clone()
     count = 0
     with torch.no_grad():
-        for path in images(spec['normaltrain']):
-            _, x = read_image(path, size, device)
-            f = model.encode(x).permute(0, 2, 3, 1).reshape(-1, 48).double()
-            total += f.sum(0)
-            square += f.square().sum(0)
+        for _, features in feature_batches(model, images(spec['normaltrain']), size, device, batch_size, workers):
+            f = features.permute(0, 2, 3, 1).reshape(-1, 48).float()
+            total += f.sum(0).double()
+            square += f.square().sum(0).double()
             count += len(f)
         model.mean.copy_((total / count).float())
         model.variance.copy_((square/count - (total/count).square()).clamp_min(1e-4).float())
         reference = []
-        for path in images(spec['normalval']):
-            _, x = read_image(path, size, device)
-            reference.append(model.distance(model.encode(x)).flatten().cpu().numpy())
+        for _, features in feature_batches(model, images(spec['normalval']), size, device, batch_size, workers):
+            reference.append(model.distance(features).flatten().cpu().numpy())
         reference = np.sort(np.concatenate(reference))
         # Bound checkpoint size while retaining quantiles across the full reference.
         reference = np.quantile(reference, np.linspace(0, 1, min(100000, len(reference)))).astype('float32')
@@ -220,19 +259,19 @@ def train(args):
     check_dataset(spec, args.duplicate_report)
     model = FabricModel(len(spec['names']), pretrained=True).to(args.device).eval()
     print('阶段1：拟合正常训练分布，并用正常验证集标定异常阈值')
-    fit_normal(model, spec, args.size, args.device)
+    fit_normal(model, spec, args.size, args.device, args.feature_batch_size, args.workers)
     print('阶段2：提取YOLO框特征并训练缺陷分类器')
     with torch.no_grad():
         vectors, targets = [], []
-        for path in images(spec['train']):
-            boxes = read_boxes(label_path(path), len(spec['names']))
-            if not boxes:
-                continue
-            _, x = read_image(path, args.size, args.device)
-            feature = model.encode(x)
-            for cls, *box in boxes:
-                vectors.append(pool_region(feature, box).cpu())
-                targets.append(cls)
+        for paths, features in feature_batches(model, images(spec['train']), args.size, args.device,
+                                                args.feature_batch_size, args.workers):
+            batch_vectors = []
+            for index, path in enumerate(paths):
+                for cls, *box in read_boxes(label_path(path), len(spec['names'])):
+                    batch_vectors.append(pool_region(features[index:index+1], box))
+                    targets.append(cls)
+            if batch_vectors:
+                vectors.extend(torch.stack(batch_vectors).cpu().unbind())
     if not targets:
         raise ValueError('训练集没有有效缺陷框')
     counts = np.bincount(targets, minlength=len(spec['names']))
@@ -240,6 +279,8 @@ def train(args):
         raise ValueError(f'以下类别没有训练框: {[spec["names"][i] for i in np.where(counts == 0)[0]]}')
     vectors, targets = torch.stack(vectors), torch.tensor(targets)
     fit_known_distribution(model, vectors.to(args.device), targets.to(args.device), args.known_quantile)
+    if not args.cpu_feature_cache:
+        vectors, targets = vectors.to(args.device), targets.to(args.device)
     loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(vectors, targets),
                                          batch_size=256, shuffle=True)
     optimizer = torch.optim.AdamW(model.classifier.parameters(), lr=args.lr)
@@ -256,15 +297,17 @@ def train(args):
     model.eval()
     correct = total_boxes = 0
     with torch.no_grad():
-        for path in images(spec['val']):
-            boxes = read_boxes(label_path(path), len(spec['names']))
-            if not boxes:
-                continue
-            _, x = read_image(path, args.size, args.device)
-            feature = model.encode(x)
-            for cls, *box in boxes:
-                correct += int(model.classifier(pool_region(feature, box)).argmax().item() == cls)
-                total_boxes += 1
+        for paths, features in feature_batches(model, images(spec['val']), args.size, args.device,
+                                                args.feature_batch_size, args.workers):
+            pooled, labels = [], []
+            for index, path in enumerate(paths):
+                for cls, *box in read_boxes(label_path(path), len(spec['names'])):
+                    pooled.append(pool_region(features[index:index+1], box))
+                    labels.append(cls)
+            if pooled:
+                predicted = model.classifier(torch.stack(pooled)).argmax(-1)
+                correct += int((predicted == torch.tensor(labels, device=args.device)).sum().item())
+                total_boxes += len(labels)
     print(f'验证集 GT 框分类准确率（非端到端检测指标）: {correct}/{total_boxes}')
     Path(args.checkpoint).parent.mkdir(parents=True, exist_ok=True)
     torch.save({'state_dict': model.cpu().state_dict(), 'names': spec['names'],
@@ -273,7 +316,7 @@ def train(args):
 
 
 class FabricInference:
-    def __init__(self, checkpoint, device='cuda'):
+    def __init__(self, checkpoint, device='cuda', fuse=True):
         self.device = device
         state = torch.load(checkpoint, map_location='cpu', weights_only=True)
         self.config = state
@@ -288,12 +331,21 @@ class FabricInference:
         self.model.load_state_dict(state['state_dict'])
         self.known_distribution_available = not missing
         self.model.to(device).eval()
+        if fuse:
+            fuse_backbone(self.model.features)
         self.reference = self.model.reference.cpu().numpy()
         self.threshold = float(np.quantile(self.reference, state['quantile']))
 
     @torch.inference_mode()
     def predict(self, path):
-        image, x = read_image(path, self.config['size'], self.device)
+        return self.predict_frame(decode_image(path), str(path))
+
+    @torch.inference_mode()
+    def predict_frame(self, image, image_id='frame'):
+        """BGR uint8 frame API: no disk IO, no visualization."""
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError('image 必须为 H×W×3 BGR uint8 数组')
+        x = preprocess_image(image, self.config['size']).unsqueeze(0).to(self.device)
         feature = self.model.encode(x)
         distance = self.model.distance(feature)[0].cpu().numpy()
         mask = (distance > self.threshold).astype('uint8')
@@ -334,7 +386,7 @@ class FabricInference:
                                 'known_class_radius': float(known_radii[cls]) if self.known_distribution_available else None,
                                 'anomaly_distance': raw,
                                 'normal_deviation_confidence': float(percentile_scores(raw, self.reference))})
-        return {'image': str(path), 'is_defect': bool(regions), 'regions': regions,
+        return {'image': str(image_id), 'is_defect': bool(regions), 'regions': regions,
                 'anomaly_distance': float(distance.max()),
                 'normal_deviation_confidence': float(percentile_scores(distance.max(), self.reference)),
                 'known_distribution_available': self.known_distribution_available,
@@ -401,6 +453,10 @@ def main():
     parser.add_argument('--checkpoint', default='checkpoints/fabric_light.pt')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--size', type=int, default=320)
+    parser.add_argument('--feature-batch-size', type=int, default=16, help='冻结骨干特征提取batch，显存不足时调小')
+    parser.add_argument('--workers', type=int, default=0, help='Windows可尝试2或4个读图进程')
+    parser.add_argument('--cpu-feature-cache', action='store_true', help='框特征留CPU，节约GPU显存')
+    parser.add_argument('--benchmark-vis', action='store_true', help='测速计入中文画框和PNG写盘')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=.001)
     parser.add_argument('--seed', type=int, default=42)
@@ -421,6 +477,8 @@ def main():
         parser.error('size 必须为 >=32 的16倍数，quantile 必须在 (0,1)')
     if not 0 < args.known_quantile <= 1:
         parser.error('known-quantile 必须在 (0,1]')
+    if args.feature_batch_size < 1 or args.workers < 0:
+        parser.error('feature-batch-size必须大于0，workers不能小于0')
     if args.epochs < 1 or args.iterations < 1 or args.min_area < 1:
         parser.error('epochs、iterations、min-area 必须大于0')
     if not 0 <= args.class_threshold <= 1 or not 0 <= args.margin <= 1:
@@ -453,19 +511,23 @@ def main():
     else:
         for _ in range(10):
             engine.predict(paths[0])
+        font = load_label_font(args.font) if args.benchmark_vis else None
         timings = []
         for i in range(args.iterations):
             if str(args.device).startswith('cuda'):
                 torch.cuda.synchronize()
             start = time.perf_counter()
-            engine.predict(paths[i % len(paths)])
+            result = engine.predict(paths[i % len(paths)])
+            if font is not None:
+                save_annotated_image(result, Path(args.vis_dir) / '_benchmark.png', font)
             if str(args.device).startswith('cuda'):
                 torch.cuda.synchronize()
             timings.append((time.perf_counter()-start)*1000)
         print(json.dumps({'device': args.device, 'size': engine.config['size'],
                           'mean_ms': float(np.mean(timings)), 'p95_ms': float(np.percentile(timings, 95)),
                           'fps': float(1000/np.mean(timings)),
-                          'scope': 'batch=1 含读图/预处理/传输/异常检测/区域分类，不含JSON写盘'}, ensure_ascii=False))
+                          'includes_visualization': args.benchmark_vis,
+                          'scope': 'batch=1 含读图/预处理/传输/检测/分类，可选画框PNG写盘，不含JSON写盘'}, ensure_ascii=False))
 
 
 if __name__ == '__main__':

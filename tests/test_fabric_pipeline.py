@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from fabric_pipeline import (FabricModel, label_path, load_spec, percentile_scores,
-                             pool_region, read_boxes, fit_normal, FabricInference, fit_known_distribution, rejection_reasons, save_annotated_image, load_label_font)
+                             pool_region, read_boxes, fit_normal, FabricInference, fit_known_distribution, rejection_reasons, save_annotated_image, load_label_font, fuse_backbone, preprocess_image, feature_batches)
 
 
 class FabricTests(unittest.TestCase):
@@ -133,6 +133,30 @@ class FabricTests(unittest.TestCase):
                 self.assertEqual(image.getpixel((20, 120)), (255, 255, 255))
             with self.assertRaises(FileNotFoundError):
                 load_label_font(str(Path(tmp) / 'missing.ttf'))
+
+    def test_fusion_equivalence_and_batch_features(self):
+        torch.set_num_threads(1)
+        torch.manual_seed(7)
+        model = FabricModel(2).eval()
+        x = torch.randn(2, 3, 64, 64)
+        with torch.no_grad():
+            before = model.encode(x)
+            fuse_backbone(model.features)
+            after = model.encode(x)
+        torch.testing.assert_close(before, after, atol=1e-6, rtol=1e-4)
+        self.assertFalse(any(isinstance(m, torch.nn.BatchNorm2d) for m in model.features.modules()))
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for i in range(3):
+                path = Path(tmp) / f'{i}.png'
+                image = np.full((512, 512, 3), 50+i*30, dtype=np.uint8)
+                cv2.imwrite(str(path), image)
+                paths.append(path)
+            batches = list(feature_batches(model, paths, 64, 'cpu', 2))
+            self.assertEqual([len(p) for p, _ in batches], [2, 1])
+            with torch.no_grad():
+                single = model.encode(preprocess_image(image, 64).unsqueeze(0))
+            torch.testing.assert_close(single, batches[-1][1])
 
     def test_backbone_and_region(self):
         model = FabricModel(19).eval()

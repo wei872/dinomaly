@@ -131,3 +131,30 @@ python fabric_pipeline.py check --data-root D:/tyhn/yolo/dataset/source5_augment
 ```
 
 若 normaltrain/normalval 完全重复，需从真实正常样本重新独立划分，不能把验证集全部移空。先备份数据，按报告处理重复，再重新运行检查；近重复增强图需另外按原始样本/采集批次分组。
+
+## GTX 1660 轻量化优化
+
+原始512×512图片不必以512输入骨干：模型默认320输入，推荐额外训练一个256配置做精度/速度对比。256输入的像素数量约为320的64%，不是保证耗时降低36%；细线/小黑点可能损失召回率。推理必须使用权重保存的输入尺寸，不能临时改小而沿用旧正常阈值。
+
+本次优化：
+- 正常拟合、正常标定、缺陷训练框提取、验证框提取都支持批量骨干前向，`--feature-batch-size 16`，读取支持 `--workers`。
+- 冻结骨干只做特征提取一次，不在100个分类训练epoch里重复运行；默认把48维训练框特征一次放到GPU，避免每轮重复传输。框很多时加 `--cpu-feature-cache` 或减小特征提取batch。
+- 正常统计在GPU用FP32做大张量归约，仅48维累计用FP64，避免1660低FP64吞吐拖慢整个特征图计算。
+- CPU完成缩放/归一化后一次传输输入，推理自动融合Conv+BN；不改变已存checkpoint，不开启在1660上未必加速的FP16。
+- `FabricInference.predict_frame(bgr_uint8_frame)` 接收相机/内存图像，不读盘、不画图、不写盘。仍然每帧仅一次骨干，异常区域批量分类。
+
+推荐先跑（原图仍保存512尺寸）：
+```bat
+python fabric_pipeline.py train --data-root D:/tyhn/yolo/dataset/source5_augmented/ --device cuda --size 256 --feature-batch-size 16 --workers 2 --checkpoint checkpoints/fabric_256.pt
+python fabric_pipeline.py predict --checkpoint checkpoints/fabric_256.pt --source D:/path/to/test --device cuda
+python fabric_pipeline.py benchmark --checkpoint checkpoints/fabric_256.pt --source D:/path/to/test --device cuda --iterations 200
+```
+
+对比包含画框和PNG写盘的速度：
+```bat
+python fabric_pipeline.py benchmark --checkpoint checkpoints/fabric_256.pt --source D:/path/to/test --device cuda --iterations 200 --benchmark-vis
+```
+
+该模式将每次结果写入 `results/annotated/_benchmark.png`（反复覆盖测速文件），计入画框、重新读原图及写盘时间，不含JSON序列化。实时产线不建议同步为每帧写PNG；建议相机帧直接调用 `predict_frame`，显示/存图由上层按需安排。正常 `predict` 仍默认逐图保存原始尺寸带框结果。
+
+优化后12项CPU单元测试通过（含融合数值等价及批量/单图特征测试），另使用512原图合成数据完成训练→保存权重→加载→内存帧推理冒烟测试。测试随机初始化骨干，不代表精度或GPU性能；未实测GTX1660。目标30FPS时均值和P95建议都小于33.3ms，且需加上相机采集和显示等业务耗时。数据SHA256检查仍会扫描全量图片，这是训练前数据完整性工作，不是每个epoch重复运行。
