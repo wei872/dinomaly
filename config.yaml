@@ -1,54 +1,26 @@
-# DinoDefectClassifier config - ViT-S/14 lightweight
-
-data:
-  data_root: "./dataset/dino"
-  img_size: 518
-  num_classes: 9
-  class_names:
-    - normal
-    - small-black-dot
-    - non-overlapping-double-latitude
-    - folded-edge-not-included
-    - feathering
-    - small-tail
-    - meridian-anomaly
-    - latitude-pollution
-    - meridian-pollution
-  num_workers: 4
-  pin_memory: true
-
-model:
-  encoder_name: "dinov2_vits14"
-  selected_layers: [9, 10, 11]
-  bottleneck_dim: 96
-  fused_dim: 256
-  noise_std: 0.1
-  drop_rate: 0.1
-
-train:
-  stage1_epochs: 50
-  stage1_lr: 0.0001
-  stage1_batch_size: 16
-
-  stage2_epochs: 50
-  stage2_lr: 0.0005
-  stage2_recon_lr: 0.00001
-  stage2_batch_size: 16
-
-  weight_decay: 0.05
-  max_grad_norm: 1.0
-  warmup_epochs: 5
-  label_smoothing: 0.1
-
-  lambda_cls: 1.0
-  lambda_mask: 1.0
-  lambda_recon: 0.5
-  lambda_anomaly: 0.3
-
-  save_dir: "./checkpoints"
-  log_dir: "./logs"
-  save_interval: 5
-  eval_interval: 5
-
-device: "cuda"
+# 当前入口: python fabric_pipeline.py train
+# 优先级: 命令行 > 本文件 > 脚本默认值
+pipeline: fabric_mobilenet
+backbone: mobilenet_v3_small_partial
+# 类别数及名称仅从该文件的 nc/names 读取：19个已知缺陷类，ID 0-18。
+# 未知类型为推理拒识结果 ID 19；正常样本独立建模，不占分类器输出类别。
+data: dataset/fabric19.yaml
+size: 448
+feature_batch_size: 8
+workers: 0
+cpu_feature_cache: false
+epochs: 100
+lr: 0.001
 seed: 42
+checkpoint: checkpoints/fabric_448.pt
+quantile: 0.995
+min_area: 2
+class_threshold: 0.65
+margin: 0.15
+known_quantile: 0.99
+strict_duplicates: false
+duplicate_report: results/dataset_duplicates.json
+output: results/fabric_predictions.json
+vis_dir: results/annotated
+no_vis: false
+# device 默认自动选择 CUDA（可用时），也可用 --device cuda 显式指定。

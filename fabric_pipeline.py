@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from PIL import Image, ImageDraw, ImageFont
+from fabric_config import apply_config_defaults
 from dataset_audit import audit_duplicates, filter_cross_split_duplicates
 from torch import nn
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
@@ -270,6 +271,7 @@ def train(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     spec = load_spec(args.data, args.data_root)
+    print(f'MobileNet训练配置: 输入={args.size}×{args.size}，已知类别={len(spec["names"])}，未知ID={len(spec["names"])}，数据配置={args.data}')
     check_dataset(spec, args.duplicate_report, args.strict_duplicates)
     model = FabricModel(len(spec['names']), pretrained=True).to(args.device).eval()
     print('阶段1：拟合正常训练分布，并用正常验证集标定异常阈值')
@@ -461,6 +463,7 @@ def save_annotated_image(result, output_path, font):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', default=str(Path(__file__).with_name('config.yaml')), help='MobileNet配置，命令行参数优先')
     parser.add_argument('mode', choices=['check', 'train', 'predict', 'benchmark'])
     parser.add_argument('--data', default='dataset/fabric19.yaml')
     parser.add_argument('--data-root')
@@ -487,6 +490,7 @@ def main():
     parser.add_argument('--font', help='支持中文的 ttf/ttc/otf 字体路径')
     parser.add_argument('--no-vis', action='store_true', help='仅保存JSON，不生成带框图片')
     parser.add_argument('--iterations', type=int, default=100)
+    apply_config_defaults(parser)
     args = parser.parse_args()
     if args.size < 32 or args.size % 16 or not 0 < args.quantile < 1:
         parser.error('size 必须为 >=32 的16倍数，quantile 必须在 (0,1)')

@@ -96,7 +96,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="DinoDefectClassifier Training")
 
     # 配置文件路径
-    parser.add_argument('--config', type=str, default='config.yaml',
+    parser.add_argument('--config', type=str, default='config_dino_legacy.yaml',
                         help='Path to config YAML file')
 
     # 可覆盖的常用参数
@@ -157,6 +157,8 @@ def get_config() -> Config:
 
     # === Step 1: 从 YAML 加载 ===
     raw = _load_yaml(args.config)
+    if raw.get('pipeline') == 'fabric_mobilenet':
+        raise ValueError('这是MobileNet配置，请运行 fabric_pipeline.py train；旧DINO入口使用config_dino_legacy.yaml')
 
     if 'data' in raw:
         for k, v in raw['data'].items():

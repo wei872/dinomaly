@@ -162,7 +162,7 @@ python fabric_pipeline.py benchmark --checkpoint checkpoints/fabric_448.pt --sou
 
 ### 当前选定配置：MobileNet + 448
 
-只修改新增轻量入口的默认输入为448，不修改原DINOv2配置。已有256/320权重仍按自身保存的尺寸推理；要用448必须重新训练并标定正常参考与已知类分布。448比320输入像素数量约多1.96倍，不代表延迟一定增加1.96倍，也不能保证1660实时性。先以batch=1测速并验证细小缺陷召回；实时预测batch仍为1，`--feature-batch-size`只影响离线特征提取。
+新增轻量入口默认输入为448；根配置现在对应MobileNet，旧DINOv2配置已单独保存。已有256/320权重仍按自身保存的尺寸推理；要用448必须重新训练并标定正常参考与已知类分布。448比320输入像素数量约多1.96倍，不代表延迟一定增加1.96倍，也不能保证1660实时性。先以batch=1测速并验证细小缺陷召回；实时预测batch仍为1，`--feature-batch-size`只影响离线特征提取。
 
 原图可以是非正方形或不同尺寸：当前预处理直接缩放为448×448（不是等比补边），检测框分别按原图实际宽、高映射回去；保存时保持原图尺寸，不强制输出512×512。大幅面图片缩小后可能丢失微小缺陷，原图读取和绘图写盘耗时也随分辨率变化。
 
@@ -178,3 +178,19 @@ python fabric_pipeline.py train --data-root D:/tyhn/yolo/dataset/source5_augment
 ```
 
 本次依赖无关的4项重复审计测试通过；新增过滤列表贯穿检查及空验证集保护的集成测试，当前环境缺少PyTorch未执行该集成测试。
+
+
+## 配置入口统一（当前版本）
+
+- `config.yaml`：当前 MobileNet 流程，`size: 448`，`data: dataset/fabric19.yaml`，默认特征提取batch=8。
+- `dataset/fabric19.yaml`：唯一类别来源，`nc: 19`及19个中文名称，ID为0–18；不在根配置重复写类别列表。
+- 「未知类型」为推理拒识ID=19，不是额外训练的softmax输出；正常样本只建立正常参考，不占缺陷分类ID。
+- `config_dino_legacy.yaml`：保留原来9类/518的历史DINO配置，仅供旧 `train.py`，不用于当前布匹MobileNet训练。
+
+`fabric_pipeline.py` 现在默认加载根 `config.yaml`，可用 `--config` 指定另一份MobileNet配置；命令行优先于YAML。修改根配置的类别数量不会生效，应修改数据集YAML及实际标签，配置中不接受重复的num_classes/class_names项。推理仍使用checkpoint保存的类别和输入尺寸，改YAML不会改变旧权重。
+
+```bat
+python fabric_pipeline.py train --data-root D:/tyhn/yolo/dataset/source5_augmented/ --device cuda
+```
+
+上述命令即使用448输入、数据集19类。训练开始会打印实际输入尺寸及已知类别数量。旧DINO的 `train.py` 默认改为读取 `config_dino_legacy.yaml`，误传MobileNet根配置会明确提示正确入口。3项配置测试通过：根配置448/19类、命令行覆盖、拒绝混用旧配置；未重跑模型训练。
